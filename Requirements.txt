@@ -1,0 +1,5 @@
+httpx
+pandas
+pytz
+ta
+python-telegram-bot==13.15
