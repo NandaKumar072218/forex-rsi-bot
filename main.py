@@ -1,14 +1,14 @@
-import requests
-import pandas as pd
-import time
 import os
+import time
+import asyncio
+import httpx
+import csv
 from datetime import datetime
 import pytz
-import csv
 
-# =========================
+# ================================
 # ENV CONFIG
-# =========================
+# ================================
 
 API_KEY = os.getenv("TWELVEDATA_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -21,63 +21,81 @@ RSI_UPPER = float(os.getenv("RSI_UPPER", 60))
 RSI_LOWER = float(os.getenv("RSI_LOWER", 40))
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 60))
-FAILURE_LIMIT = int(os.getenv("FAILURE_LIMIT", 5))
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", 120))
 
 IST = pytz.timezone("Asia/Kolkata")
 
-# =========================
-# STATE TRACKERS
-# =========================
+# ================================
+# GLOBAL STATE
+# ================================
 
-api_calls_today = 0
-failure_count = 0
-last_alert_state = {}  # track last RSI state per symbol/timeframe
+last_alert_state = {}
+telegram_cache = {}
 
+# ================================
+# HTTP CLIENT (REUSE CONNECTION)
+# ================================
 
-# =========================
-# TELEGRAM FUNCTION
-# =========================
+client = httpx.AsyncClient(timeout=10)
 
-def send_telegram(message):
-    global failure_count
+# ================================
+# TELEGRAM SAFE SEND
+# ================================
+
+async def send_telegram(message, cooldown=30):
     try:
+        now = time.time()
+
+        if message in telegram_cache:
+            if now - telegram_cache[message] < cooldown:
+                return
+
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": CHAT_ID, "text": message}
-        requests.post(url, data=payload)
+
+        await client.post(
+            url,
+            json={"chat_id": CHAT_ID, "text": message}
+        )
+
+        telegram_cache[message] = now
+
     except Exception:
-        failure_count += 1
+        pass
 
+# ================================
+# CSV LOGGER
+# ================================
 
-# =========================
-# LOG TO CSV
-# =========================
-
-def log_to_csv(symbol, timeframe, rsi_value, price, direction):
-    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
-    filename = f"{symbol}_{datetime.now(IST).date()}.csv"
-
-    file_exists = os.path.isfile(filename)
-
-    with open(filename, mode="a", newline="") as file:
-        writer = csv.writer(file)
-
-        if not file_exists:
-            writer.writerow(["DateTime_IST", "Symbol", "Timeframe", "RSI", "Price", "Direction"])
-
-        writer.writerow([now, symbol, timeframe, rsi_value, price, direction])
-
-
-# =========================
-# FETCH RSI
-# =========================
-
-def fetch_rsi(symbol, timeframe):
-    global api_calls_today, failure_count
+def log_csv(symbol, timeframe, rsi, price, direction):
 
     try:
-        url = "https://api.twelvedata.com/rsi"
+        now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+        filename = f"{symbol}_{datetime.now(IST).date()}.csv"
+
+        file_exists = os.path.isfile(filename)
+
+        with open(filename, "a", newline="") as f:
+            writer = csv.writer(f)
+
+            if not file_exists:
+                writer.writerow(
+                    ["DateTime", "Symbol", "Timeframe", "RSI", "Price", "Direction"]
+                )
+
+            writer.writerow([now, symbol, timeframe, rsi, price, direction])
+
+    except Exception:
+        pass
+
+# ================================
+# FETCH RSI + PRICE
+# ================================
+
+async def fetch_rsi_price(symbol, timeframe):
+
+    try:
+        rsi_url = "https://api.twelvedata.com/rsi"
+
         params = {
             "symbol": symbol,
             "interval": timeframe,
@@ -86,93 +104,95 @@ def fetch_rsi(symbol, timeframe):
             "apikey": API_KEY
         }
 
-        response = requests.get(url, params=params)
-        api_calls_today += 1
-
-        data = response.json()
+        r = await client.get(rsi_url, params=params)
+        data = r.json()
 
         if "values" not in data:
-            failure_count += 1
             return None, None
 
-        rsi_value = float(data["values"][0]["rsi"])
+        rsi = float(data["values"][0]["rsi"])
 
-        # Fetch price
         price_url = "https://api.twelvedata.com/price"
-        price_params = {"symbol": symbol, "apikey": API_KEY}
-        price_response = requests.get(price_url, params=price_params)
-        price = float(price_response.json()["price"])
 
-        return rsi_value, price
+        price_res = await client.get(
+            price_url,
+            params={"symbol": symbol, "apikey": API_KEY}
+        )
+
+        price = float(price_res.json()["price"])
+
+        return rsi, price
 
     except Exception:
-        failure_count += 1
         return None, None
 
+# ================================
+# MAIN BOT LOOP
+# ================================
 
-# =========================
-# CIRCUIT BREAKER
-# =========================
+async def bot_loop():
 
-def check_circuit_breaker():
-    global failure_count
-
-    if failure_count >= FAILURE_LIMIT:
-        print("⚠️ Too many failures. Cooling down...")
-        time.sleep(COOLDOWN_SECONDS)
-        failure_count = 0
-
-
-# =========================
-# MAIN LOOP
-# =========================
-
-def main():
-    global last_alert_state
-
-    print("🚀 RSI Alert Bot Started")
+    print("🚀 Production Trading Bot Started")
 
     while True:
-        now = datetime.now(IST)
-        minute = now.minute
 
-        for timeframe in TIMEFRAMES:
+        try:
+            now = datetime.now(IST)
+            minute = now.minute
 
-            # Only run on candle close
-            if timeframe == "5min" and minute % 5 != 0:
-                continue
-            if timeframe == "15min" and minute % 15 != 0:
-                continue
+            for timeframe in TIMEFRAMES:
 
-            for symbol in SYMBOLS:
-
-                rsi, price = fetch_rsi(symbol, timeframe)
-
-                if rsi is None:
+                # Candle close trigger
+                if timeframe == "5min" and minute % 5 != 0:
                     continue
 
-                key = f"{symbol}_{timeframe}"
+                if timeframe == "15min" and minute % 15 != 0:
+                    continue
 
-                previous_state = last_alert_state.get(key, "neutral")
+                for symbol in SYMBOLS:
 
-                if rsi > RSI_UPPER and previous_state != "above":
-                    message = f"📈 {symbol} RSI crossed ABOVE {RSI_UPPER} on {timeframe}\nRSI: {rsi}\nPrice: {price}"
-                    send_telegram(message)
-                    log_to_csv(symbol, timeframe, rsi, price, "ABOVE")
-                    last_alert_state[key] = "above"
+                    rsi, price = await fetch_rsi_price(symbol, timeframe)
 
-                elif rsi < RSI_LOWER and previous_state != "below":
-                    message = f"📉 {symbol} RSI crossed BELOW {RSI_LOWER} on {timeframe}\nRSI: {rsi}\nPrice: {price}"
-                    send_telegram(message)
-                    log_to_csv(symbol, timeframe, rsi, price, "BELOW")
-                    last_alert_state[key] = "below"
+                    if rsi is None:
+                        continue
 
-                elif RSI_LOWER <= rsi <= RSI_UPPER:
-                    last_alert_state[key] = "neutral"
+                    key = f"{symbol}_{timeframe}"
 
-        check_circuit_breaker()
-        time.sleep(CHECK_INTERVAL)
+                    prev_state = last_alert_state.get(key, "neutral")
 
+                    # ABOVE ALERT
+                    if rsi > RSI_UPPER and prev_state != "above":
+
+                        msg = f"📈 {symbol} RSI ABOVE {RSI_UPPER}\nRSI: {rsi}\nPrice: {price}"
+
+                        await send_telegram(msg)
+
+                        log_csv(symbol, timeframe, rsi, price, "ABOVE")
+
+                        last_alert_state[key] = "above"
+
+                    # BELOW ALERT
+                    elif rsi < RSI_LOWER and prev_state != "below":
+
+                        msg = f"📉 {symbol} RSI BELOW {RSI_LOWER}\nRSI: {rsi}\nPrice: {price}"
+
+                        await send_telegram(msg)
+
+                        log_csv(symbol, timeframe, rsi, price, "BELOW")
+
+                        last_alert_state[key] = "below"
+
+                    else:
+                        last_alert_state[key] = "neutral"
+
+            await asyncio.sleep(CHECK_INTERVAL)
+
+        except Exception:
+            await asyncio.sleep(5)
+
+# ================================
+# ENTRY POINT
+# ================================
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(bot_loop())
