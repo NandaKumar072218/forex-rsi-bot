@@ -17,6 +17,7 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SYMBOLS = os.getenv("SYMBOLS", "XAUUSD").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "5min,15min").split(",")
 
+RSI_PERIOD = 14
 RSI_UPPER = float(os.getenv("RSI_UPPER", 60))
 RSI_LOWER = float(os.getenv("RSI_LOWER", 40))
 
@@ -30,12 +31,50 @@ IST = pytz.timezone("Asia/Kolkata")
 
 last_alert_state = {}
 telegram_cache = {}
+api_rate_remaining = "N/A"
+rate_limit_warning_sent = False
+
+client = httpx.AsyncClient(timeout=15)
 
 # ================================
-# HTTP CLIENT (REUSE CONNECTION)
+# RSI CALCULATION (Wilder Method)
 # ================================
 
-client = httpx.AsyncClient(timeout=10)
+def calculate_rsi(closes, period=14):
+
+    if len(closes) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, period + 1):
+        change = closes[i] - closes[i - 1]
+        if change >= 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    for i in range(period + 1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gain = max(change, 0)
+        loss = max(-change, 0)
+
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+
+    if avg_loss == 0:
+        return 100
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    return round(rsi, 2)
 
 # ================================
 # TELEGRAM SAFE SEND
@@ -44,7 +83,6 @@ client = httpx.AsyncClient(timeout=10)
 async def send_telegram(message, cooldown=30):
     try:
         now = time.time()
-
         if message in telegram_cache:
             if now - telegram_cache[message] < cooldown:
                 return
@@ -58,91 +96,87 @@ async def send_telegram(message, cooldown=30):
 
         telegram_cache[message] = now
 
-    except Exception:
-        pass
+    except Exception as e:
+        print("Telegram Error:", e)
 
 # ================================
 # CSV LOGGER
 # ================================
 
 def log_csv(symbol, timeframe, rsi, price, direction):
-
     try:
         now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-
         filename = f"{symbol}_{datetime.now(IST).date()}.csv"
-
         file_exists = os.path.isfile(filename)
 
         with open(filename, "a", newline="") as f:
             writer = csv.writer(f)
-
             if not file_exists:
                 writer.writerow(
                     ["DateTime", "Symbol", "Timeframe", "RSI", "Price", "Direction"]
                 )
-
             writer.writerow([now, symbol, timeframe, rsi, price, direction])
 
-    except Exception:
-        pass
+    except Exception as e:
+        print("CSV Error:", e)
 
 # ================================
-# FETCH RSI + PRICE
+# FETCH TIME SERIES ONCE
 # ================================
 
-async def fetch_rsi_price(symbol, timeframe):
+async def fetch_data(symbol, timeframe):
+
+    global api_rate_remaining
 
     try:
-        rsi_url = "https://api.twelvedata.com/rsi"
+        url = "https://api.twelvedata.com/time_series"
 
         params = {
             "symbol": symbol,
             "interval": timeframe,
-            "time_period": 14,
-            "series_type": "close",
+            "outputsize": 100,
             "apikey": API_KEY
         }
 
-        r = await client.get(rsi_url, params=params)
+        r = await client.get(url, params=params)
+
+        api_rate_remaining = r.headers.get("X-RateLimit-Remaining", "N/A")
+
         data = r.json()
 
         if "values" not in data:
+            print("TimeSeries Error:", data)
             return None, None
 
-        rsi = float(data["values"][0]["rsi"])
+        closes = [float(x["close"]) for x in reversed(data["values"])]
 
-        price_url = "https://api.twelvedata.com/price"
+        price = closes[-1]
 
-        price_res = await client.get(
-            price_url,
-            params={"symbol": symbol, "apikey": API_KEY}
-        )
-
-        price = float(price_res.json()["price"])
+        rsi = calculate_rsi(closes, RSI_PERIOD)
 
         return rsi, price
 
-    except Exception:
+    except Exception as e:
+        print("Fetch Error:", e)
         return None, None
 
 # ================================
-# MAIN BOT LOOP
+# MAIN LOOP
 # ================================
 
 async def bot_loop():
 
-    print("🚀 Production Trading Bot Started")
+    global rate_limit_warning_sent
+
+    print("🚀 Optimized Production RSI Bot Started")
 
     while True:
-
         try:
             now = datetime.now(IST)
             minute = now.minute
 
             for timeframe in TIMEFRAMES:
 
-                # Candle close trigger
                 if timeframe == "5min" and minute % 5 != 0:
                     continue
 
@@ -151,33 +185,55 @@ async def bot_loop():
 
                 for symbol in SYMBOLS:
 
-                    rsi, price = await fetch_rsi_price(symbol, timeframe)
+                    rsi, price = await fetch_data(symbol, timeframe)
 
                     if rsi is None:
                         continue
 
                     key = f"{symbol}_{timeframe}"
-
                     prev_state = last_alert_state.get(key, "neutral")
 
-                    # ABOVE ALERT
+                    # Rate Limit Warning
+                    try:
+                        remaining = int(api_rate_remaining)
+                        if remaining < 20 and not rate_limit_warning_sent:
+                            await send_telegram(
+                                f"⚠️ API Remaining Low → {remaining}"
+                            )
+                            rate_limit_warning_sent = True
+                    except:
+                        pass
+
+                    # ABOVE
                     if rsi > RSI_UPPER and prev_state != "above":
 
-                        msg = f"📈 {symbol} RSI ABOVE {RSI_UPPER}\nRSI: {rsi}\nPrice: {price}"
+                        msg = (
+                            f"📈 RSI ALERT (ABOVE)\n"
+                            f"Symbol: {symbol}\n"
+                            f"Timeframe: {timeframe}\n"
+                            f"RSI: {rsi}\n"
+                            f"Price: {price}\n"
+                            f"API Remaining: {api_rate_remaining}"
+                        )
 
                         await send_telegram(msg)
-
                         log_csv(symbol, timeframe, rsi, price, "ABOVE")
 
                         last_alert_state[key] = "above"
 
-                    # BELOW ALERT
+                    # BELOW
                     elif rsi < RSI_LOWER and prev_state != "below":
 
-                        msg = f"📉 {symbol} RSI BELOW {RSI_LOWER}\nRSI: {rsi}\nPrice: {price}"
+                        msg = (
+                            f"📉 RSI ALERT (BELOW)\n"
+                            f"Symbol: {symbol}\n"
+                            f"Timeframe: {timeframe}\n"
+                            f"RSI: {rsi}\n"
+                            f"Price: {price}\n"
+                            f"API Remaining: {api_rate_remaining}"
+                        )
 
                         await send_telegram(msg)
-
                         log_csv(symbol, timeframe, rsi, price, "BELOW")
 
                         last_alert_state[key] = "below"
@@ -187,11 +243,12 @@ async def bot_loop():
 
             await asyncio.sleep(CHECK_INTERVAL)
 
-        except Exception:
+        except Exception as e:
+            print("Main Loop Error:", e)
             await asyncio.sleep(5)
 
 # ================================
-# ENTRY POINT
+# ENTRY
 # ================================
 
 if __name__ == "__main__":
