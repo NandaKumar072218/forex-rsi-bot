@@ -106,7 +106,8 @@ async def send_telegram(message, cooldown=30):
 def log_csv(symbol, timeframe, rsi, price, direction):
     try:
         now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-        filename = f"{symbol}_{datetime.now(IST).date()}.csv"
+        safe_symbol = symbol.replace("/", "_").replace(":", "_")
+        filename = f"{safe_symbol}_{datetime.now(IST).date()}.csv"
         file_exists = os.path.isfile(filename)
 
         with open(filename, "a", newline="") as f:
