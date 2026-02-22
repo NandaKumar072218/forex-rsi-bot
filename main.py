@@ -14,7 +14,7 @@ API_KEY = os.getenv("TWELVEDATA_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = os.getenv("SYMBOLS").split(",")
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USD").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "5min,15min").split(",")
 
 RSI_PERIOD = 14
@@ -33,15 +33,16 @@ last_alert_state = {}
 telegram_cache = {}
 api_rate_remaining = "N/A"
 rate_limit_warning_sent = False
+api_total_hits = 0
+csv_sent_today = False
 
 client = httpx.AsyncClient(timeout=15)
 
 # ================================
-# RSI CALCULATION (Wilder Method)
+# RSI CALCULATION (Wilder)
 # ================================
 
 def calculate_rsi(closes, period=14):
-
     if len(closes) < period + 1:
         return None
 
@@ -122,12 +123,12 @@ def log_csv(symbol, timeframe, rsi, price, direction):
         print("CSV Error:", e)
 
 # ================================
-# FETCH TIME SERIES ONCE
+# FETCH DATA
 # ================================
 
 async def fetch_data(symbol, timeframe):
 
-    global api_rate_remaining
+    global api_rate_remaining, api_total_hits
 
     try:
         url = "https://api.twelvedata.com/time_series"
@@ -141,6 +142,7 @@ async def fetch_data(symbol, timeframe):
 
         r = await client.get(url, params=params)
 
+        api_total_hits += 1
         api_rate_remaining = r.headers.get("X-RateLimit-Remaining", "N/A")
 
         data = r.json()
@@ -150,7 +152,6 @@ async def fetch_data(symbol, timeframe):
             return None, None
 
         closes = [float(x["close"]) for x in reversed(data["values"])]
-
         price = closes[-1]
 
         rsi = calculate_rsi(closes, RSI_PERIOD)
@@ -167,14 +168,53 @@ async def fetch_data(symbol, timeframe):
 
 async def bot_loop():
 
-    global rate_limit_warning_sent
+    global rate_limit_warning_sent, csv_sent_today
 
-    print("🚀 Optimized Production RSI Bot Started")
+    print("🚀 Production RSI Bot Started")
+    print("SYMBOLS:", SYMBOLS)
+    print("TIMEFRAMES:", TIMEFRAMES)
+    print("CHECK_INTERVAL:", CHECK_INTERVAL)
 
     while True:
         try:
             now = datetime.now(IST)
+            current_hour = now.hour
             minute = now.minute
+
+            # ==========================
+            # SEND DAILY CSV AT 11PM
+            # ==========================
+
+            if current_hour == 23 and minute == 0 and not csv_sent_today:
+
+                for symbol in SYMBOLS:
+                    safe_symbol = symbol.replace("/", "_").replace(":", "_")
+                    filename = f"{safe_symbol}_{now.date()}.csv"
+
+                    if os.path.isfile(filename):
+                        try:
+                            await client.post(
+                                f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
+                                data={"chat_id": CHAT_ID},
+                                files={"document": open(filename, "rb")}
+                            )
+                            print("CSV Sent:", filename)
+                        except Exception as e:
+                            print("CSV Send Error:", e)
+
+                csv_sent_today = True
+
+            # Reset next day
+            if current_hour == 0 and minute == 1:
+                csv_sent_today = False
+
+            # ==========================
+            # RUN ONLY 5AM–11PM
+            # ==========================
+
+            if current_hour < 5 or current_hour > 23:
+                await asyncio.sleep(60)
+                continue
 
             for timeframe in TIMEFRAMES:
 
@@ -194,52 +234,55 @@ async def bot_loop():
                     key = f"{symbol}_{timeframe}"
                     prev_state = last_alert_state.get(key, "neutral")
 
-                    # Rate Limit Warning
+                    # Rate limit warning
                     try:
                         remaining = int(api_rate_remaining)
                         if remaining < 20 and not rate_limit_warning_sent:
                             await send_telegram(
-                                f"⚠️ API Remaining Low → {remaining}"
+                                f"⚠️ API Remaining Low → {remaining}\n"
+                                f"Total Used: {api_total_hits}"
                             )
                             rate_limit_warning_sent = True
                     except:
                         pass
 
-                    # ABOVE
+                    # ==========================
+                    # TRUE CROSSOVER LOGIC
+                    # ==========================
+
                     if rsi > RSI_UPPER and prev_state != "above":
 
                         msg = (
-                            f"📈 RSI ALERT (ABOVE)\n"
+                            f"📈 RSI CROSS ABOVE {RSI_UPPER}\n"
                             f"Symbol: {symbol}\n"
                             f"Timeframe: {timeframe}\n"
                             f"RSI: {rsi}\n"
                             f"Price: {price}\n"
+                            f"API Used: {api_total_hits}\n"
                             f"API Remaining: {api_rate_remaining}"
                         )
 
                         await send_telegram(msg)
                         log_csv(symbol, timeframe, rsi, price, "ABOVE")
-
                         last_alert_state[key] = "above"
 
-                    # BELOW
                     elif rsi < RSI_LOWER and prev_state != "below":
 
                         msg = (
-                            f"📉 RSI ALERT (BELOW)\n"
+                            f"📉 RSI CROSS BELOW {RSI_LOWER}\n"
                             f"Symbol: {symbol}\n"
                             f"Timeframe: {timeframe}\n"
                             f"RSI: {rsi}\n"
                             f"Price: {price}\n"
+                            f"API Used: {api_total_hits}\n"
                             f"API Remaining: {api_rate_remaining}"
                         )
 
                         await send_telegram(msg)
                         log_csv(symbol, timeframe, rsi, price, "BELOW")
-
                         last_alert_state[key] = "below"
 
-                    else:
+                    elif RSI_LOWER < rsi < RSI_UPPER:
                         last_alert_state[key] = "neutral"
 
             await asyncio.sleep(CHECK_INTERVAL)
