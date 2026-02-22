@@ -14,7 +14,7 @@ API_KEY = os.getenv("TWELVEDATA_API_KEY")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOLS = os.getenv("SYMBOLS", "XAUUSD").split(",")
+SYMBOLS = os.getenv("SYMBOLS").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "5min,15min").split(",")
 
 RSI_PERIOD = 14
